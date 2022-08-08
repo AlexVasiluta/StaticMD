@@ -61,6 +61,13 @@ func (c *CGI) genInputs(r *http.Request) otto.Value {
 			rez[k] = v[0]
 		}
 	}
+	for k, v := range r.PostForm {
+		if len(v) == 0 {
+			rez[k] = ""
+		} else {
+			rez[k] = v[0]
+		}
+	}
 	val, err := c.vm.ToValue(rez)
 	if err != nil {
 		panic(err)
@@ -69,6 +76,7 @@ func (c *CGI) genInputs(r *http.Request) otto.Value {
 }
 
 func (c *CGI) Execute(w http.ResponseWriter, r *http.Request) error {
+	r.ParseForm()
 	out, err := c.f.Call(otto.NullValue(), c.genInputs(r))
 	if err != nil {
 		return err
@@ -104,7 +112,7 @@ func (c *CGI) Execute(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (c *CGI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if err := c.Execute(); err != nil {
+	if err := c.Execute(w, r); err != nil {
 		json.NewEncoder(w).Encode(struct {
 			Status string      `json:"status"`
 			Data   interface{} `json:"data"`

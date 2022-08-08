@@ -10,8 +10,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 
+	"github.com/AlexVasiluta/staticMD/jsrunner"
 	"github.com/caarlos0/env/v6"
 
 	chtml "github.com/alecthomas/chroma/formatters/html"
@@ -26,11 +28,12 @@ import (
 )
 
 type StaticMD struct {
-	parser   goldmark.Markdown
-	content  fs.FS
-	staticFS fs.FS
-	templ    *template.Template
-	debug    bool
+	parser     goldmark.Markdown
+	content    fs.FS
+	staticFS   fs.FS
+	handlersFS fs.FS
+	templ      *template.Template
+	debug      bool
 }
 
 type TemplParams struct {
@@ -64,6 +67,24 @@ func (s *StaticMD) GetRouter() http.Handler {
 	}
 
 	r.Mount("/static", http.StripPrefix("/static", http.FileServer(http.FS(s.staticFS))))
+	r.Mount("/handlers", http.StripPrefix("/handlers", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.Trim(path.Clean(r.URL.Path), "/") + ".js"
+
+		f, err := s.handlersFS.Open(p)
+		if err != nil {
+			http.Error(w, "Not Found", 404)
+			return
+		}
+		defer f.Close()
+
+		handler, err := jsrunner.NewCGI(f)
+		if err != nil {
+			http.Error(w, "Couldn't initialize handler", 404)
+			return
+		}
+
+		handler.ServeHTTP(w, r)
+	})))
 	r.Mount("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
@@ -79,14 +100,14 @@ func (s *StaticMD) GetRouter() http.Handler {
 		if strings.HasSuffix(path, ".md") { // the request wants the raw md file
 			file, err := s.content.Open(path)
 			if err != nil {
-				fmt.Fprintln(w, "Not Found")
+				http.Error(w, "Not found", 404)
 				return
 			}
 			defer file.Close()
 
 			st, err := file.Stat()
 			if err != nil {
-				fmt.Fprintln(w, "Not Found")
+				http.Error(w, "Not found", 404)
 				return
 			}
 
@@ -102,7 +123,7 @@ func (s *StaticMD) GetRouter() http.Handler {
 			ctx := parser.NewContext()
 			var buf bytes.Buffer
 			if err := s.parser.Convert(md, &buf, parser.WithContext(ctx)); err != nil {
-				fmt.Fprintln(w, "Error")
+				http.Error(w, "Internal Server Error", 500)
 				return
 			}
 
@@ -134,7 +155,7 @@ func (s *StaticMD) GetRouter() http.Handler {
 		// try and serve a regular file
 		file, err := s.content.Open(path)
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrInvalid) {
-			fmt.Fprintln(w, "Not Found")
+			http.Error(w, "Not Found", 404)
 			return
 		} else if err != nil {
 			fmt.Println(err)
@@ -187,7 +208,12 @@ func New(debug bool, ffs fs.FS) (*StaticMD, error) {
 		return nil, err
 	}
 
-	return &StaticMD{parser: md, content: contentFS, debug: debug, staticFS: staticFS}, nil
+	handlersFS, err := fs.Sub(ffs, "handlers")
+	if err != nil {
+		return nil, err
+	}
+
+	return &StaticMD{parser: md, content: contentFS, debug: debug, staticFS: staticFS, handlersFS: handlersFS}, nil
 }
 
 type config struct {

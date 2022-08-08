@@ -1,6 +1,7 @@
 FROM golang:alpine AS builder
+RUN apk add git
 WORKDIR /app
-COPY go.mod go.sum main.go js_runner.go ./
+COPY . . 
 RUN go get -v .
 RUN go build -o output .
 
