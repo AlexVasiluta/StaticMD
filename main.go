@@ -13,14 +13,12 @@ import (
 	"path"
 	"strings"
 
-	"github.com/AlexVasiluta/staticMD/jsrunner"
 	"github.com/caarlos0/env/v6"
 
-	chtml "github.com/alecthomas/chroma/formatters/html"
 	"github.com/go-chi/chi/v5"
 	mathjax "github.com/litao91/goldmark-mathjax"
 	"github.com/yuin/goldmark"
-	highlighting "github.com/yuin/goldmark-highlighting"
+	highlighting "github.com/yuin/goldmark-highlighting/v2"
 	meta "github.com/yuin/goldmark-meta"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
@@ -28,12 +26,11 @@ import (
 )
 
 type StaticMD struct {
-	parser     goldmark.Markdown
-	content    fs.FS
-	staticFS   fs.FS
-	handlersFS fs.FS
-	templ      *template.Template
-	debug      bool
+	parser   goldmark.Markdown
+	content  fs.FS
+	staticFS fs.FS
+	templ    *template.Template
+	debug    bool
 }
 
 type TemplParams struct {
@@ -67,38 +64,16 @@ func (s *StaticMD) GetRouter() http.Handler {
 	}
 
 	r.Mount("/static", http.StripPrefix("/static", http.FileServer(http.FS(s.staticFS))))
-	r.Mount("/handlers", http.StripPrefix("/handlers", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := strings.Trim(path.Clean(r.URL.Path), "/") + ".js"
-
-		f, err := s.handlersFS.Open(p)
-		if err != nil {
-			http.Error(w, "Not Found", 404)
-			return
-		}
-		defer f.Close()
-
-		handler, err := jsrunner.NewCGI(f)
-		if err != nil {
-			http.Error(w, "Couldn't initialize handler", 404)
-			return
-		}
-
-		handler.ServeHTTP(w, r)
-	})))
 	r.Mount("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
+		pth := path.Clean(strings.Trim(r.URL.Path, "/"))
 
-		if strings.HasSuffix(path, "/") {
-			path += "index"
+		val, err := fs.Stat(s.content, pth)
+		if err == nil && val.IsDir() {
+			pth = path.Join(pth, "index")
 		}
 
-		path = strings.Trim(path, "/")
-		if strings.HasPrefix(path, "/") {
-			path = path[1:]
-		}
-
-		if strings.HasSuffix(path, ".md") { // the request wants the raw md file
-			file, err := s.content.Open(path)
+		if strings.HasSuffix(pth, ".md") { // the request wants the raw md file
+			file, err := s.content.Open(pth)
 			if err != nil {
 				http.Error(w, "Not found", 404)
 				return
@@ -117,7 +92,7 @@ func (s *StaticMD) GetRouter() http.Handler {
 		}
 
 		// check if an .md file exists, and if so, render it
-		npath := path + ".md"
+		npath := pth + ".md"
 		md, err := fs.ReadFile(s.content, npath)
 		if err == nil {
 			ctx := parser.NewContext()
@@ -139,7 +114,7 @@ func (s *StaticMD) GetRouter() http.Handler {
 		}
 
 		// try and serve a file that has just the content
-		npath = path + ".body"
+		npath = pth + ".body"
 		chtm, err := fs.ReadFile(s.content, npath)
 		if err == nil {
 			t := TemplParams{
@@ -152,8 +127,24 @@ func (s *StaticMD) GetRouter() http.Handler {
 			return
 		}
 
+		// try and serve html content
+		npath = pth + ".html"
+		htm, err := s.content.Open(npath)
+		if err == nil {
+			defer htm.Close()
+
+			st, err := htm.Stat()
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+
+			http.ServeContent(w, r, st.Name(), st.ModTime(), htm.(io.ReadSeeker))
+			return
+		}
+
 		// try and serve a regular file
-		file, err := s.content.Open(path)
+		file, err := s.content.Open(pth)
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrInvalid) {
 			http.Error(w, "Not Found", 404)
 			return
@@ -190,10 +181,7 @@ func New(debug bool, ffs fs.FS) (*StaticMD, error) {
 			meta.Meta,
 			mathjax.MathJax,
 			highlighting.NewHighlighting(
-				highlighting.WithStyle("monokai"),
-				highlighting.WithFormatOptions(
-					chtml.WithLineNumbers(true),
-				),
+				highlighting.WithStyle("xcode"),
 			),
 		),
 	)
@@ -208,12 +196,7 @@ func New(debug bool, ffs fs.FS) (*StaticMD, error) {
 		return nil, err
 	}
 
-	handlersFS, err := fs.Sub(ffs, "handlers")
-	if err != nil {
-		return nil, err
-	}
-
-	return &StaticMD{parser: md, content: contentFS, debug: debug, staticFS: staticFS, handlersFS: handlersFS}, nil
+	return &StaticMD{parser: md, content: contentFS, debug: debug, staticFS: staticFS}, nil
 }
 
 type config struct {
