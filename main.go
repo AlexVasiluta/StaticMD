@@ -2,10 +2,8 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -15,7 +13,6 @@ import (
 
 	"github.com/caarlos0/env/v6"
 
-	"github.com/go-chi/chi/v5"
 	mathjax "github.com/litao91/goldmark-mathjax"
 	"github.com/yuin/goldmark"
 	highlighting "github.com/yuin/goldmark-highlighting/v2"
@@ -26,11 +23,9 @@ import (
 )
 
 type StaticMD struct {
-	parser   goldmark.Markdown
-	content  fs.FS
-	staticFS fs.FS
-	templ    *template.Template
-	debug    bool
+	parser  goldmark.Markdown
+	content fs.FS
+	debug   bool
 }
 
 type TemplParams struct {
@@ -38,34 +33,22 @@ type TemplParams struct {
 	Metadata map[string]interface{}
 }
 
-func (s *StaticMD) LoadTemplates() (err error) {
-	s.templ, err = template.ParseFS(s.content, "templ/*")
-	return
-}
-
 func (s *StaticMD) GetRouter() http.Handler {
-	r := chi.NewRouter()
 
-	if err := s.LoadTemplates(); err != nil {
-		fmt.Println(err)
-		return nil
-	}
-
-	if s.debug {
-		r.Use(func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if err := s.LoadTemplates(); err != nil {
-					fmt.Println(err)
-					return
-				}
-				next.ServeHTTP(w, r)
-			})
-		})
-	}
-
-	r.Mount("/static", http.StripPrefix("/static", http.FileServer(http.FS(s.staticFS))))
-	r.Mount("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pth := path.Clean(strings.Trim(r.URL.Path, "/"))
+
+		if strings.HasPrefix(pth, "static") {
+			http.ServeFileFS(w, r, s.content, pth)
+			return
+		}
+
+		templ, err := template.ParseFS(s.content, "templ/*")
+		if err != nil {
+			fmt.Println(err)
+			http.Error(w, "Could not compile template", http.StatusInternalServerError)
+			return
+		}
 
 		val, err := fs.Stat(s.content, pth)
 		if err == nil && val.IsDir() {
@@ -73,28 +56,12 @@ func (s *StaticMD) GetRouter() http.Handler {
 		}
 
 		if strings.HasSuffix(pth, ".md") { // the request wants the raw md file
-			file, err := s.content.Open(pth)
-			if err != nil {
-				http.Error(w, "Not found", 404)
-				return
-			}
-			defer file.Close()
-
-			st, err := file.Stat()
-			if err != nil {
-				http.Error(w, "Not found", 404)
-				return
-			}
-
-			http.ServeContent(w, r, st.Name(), st.ModTime(), file.(io.ReadSeeker))
-			io.Copy(w, file)
+			http.ServeFileFS(w, r, s.content, pth)
 			return
 		}
 
 		// check if an .md file exists, and if so, render it
-		npath := pth + ".md"
-		md, err := fs.ReadFile(s.content, npath)
-		if err == nil {
+		if md, err := fs.ReadFile(s.content, pth+".md"); err == nil {
 			ctx := parser.NewContext()
 			var buf bytes.Buffer
 			if err := s.parser.Convert(md, &buf, parser.WithContext(ctx)); err != nil {
@@ -107,62 +74,34 @@ func (s *StaticMD) GetRouter() http.Handler {
 				Metadata: meta.Get(ctx),
 			}
 
-			if err := s.templ.ExecuteTemplate(w, "page.templ", t); err != nil {
+			if err := templ.ExecuteTemplate(w, "page.templ", t); err != nil {
 				fmt.Println(err)
 			}
 			return
 		}
 
 		// try and serve a file that has just the content
-		npath = pth + ".body"
-		chtm, err := fs.ReadFile(s.content, npath)
-		if err == nil {
+		if chtm, err := fs.ReadFile(s.content, pth+".body"); err == nil {
 			t := TemplParams{
 				Content:  template.HTML(chtm),
 				Metadata: nil,
 			}
-			if err := s.templ.ExecuteTemplate(w, "page.templ", t); err != nil {
+			if err := templ.ExecuteTemplate(w, "page.templ", t); err != nil {
 				fmt.Println(err)
 			}
 			return
 		}
 
 		// try and serve html content
-		npath = pth + ".html"
-		htm, err := s.content.Open(npath)
-		if err == nil {
-			defer htm.Close()
-
-			st, err := htm.Stat()
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-
-			http.ServeContent(w, r, st.Name(), st.ModTime(), htm.(io.ReadSeeker))
+		if _, err := fs.ReadFile(s.content, pth+".html"); err == nil {
+			http.ServeFileFS(w, r, s.content, pth+".html")
 			return
 		}
 
 		// try and serve a regular file
-		file, err := s.content.Open(pth)
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrInvalid) {
-			http.Error(w, "Not Found", 404)
-			return
-		} else if err != nil {
-			fmt.Println(err)
-			return
-		}
-		defer file.Close()
-		st, err := file.Stat()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
+		http.ServeFileFS(w, r, s.content, pth)
+	})
 
-		http.ServeContent(w, r, st.Name(), st.ModTime(), file.(io.ReadSeeker))
-	}))
-
-	return r
 }
 
 func New(debug bool, ffs fs.FS) (*StaticMD, error) {
@@ -186,17 +125,7 @@ func New(debug bool, ffs fs.FS) (*StaticMD, error) {
 		),
 	)
 
-	staticFS, err := fs.Sub(ffs, "static")
-	if err != nil {
-		return nil, err
-	}
-
-	contentFS, err := fs.Sub(ffs, "content")
-	if err != nil {
-		return nil, err
-	}
-
-	return &StaticMD{parser: md, content: contentFS, debug: debug, staticFS: staticFS}, nil
+	return &StaticMD{parser: md, content: ffs, debug: debug}, nil
 }
 
 type config struct {
