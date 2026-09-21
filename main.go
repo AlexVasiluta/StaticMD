@@ -2,16 +2,21 @@ package main
 
 import (
 	"bytes"
-	"fmt"
+	"cmp"
+	"context"
+	"errors"
 	"html/template"
 	"io/fs"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path"
+	"strconv"
 	"strings"
-
-	"github.com/caarlos0/env/v6"
+	"syscall"
+	"time"
 
 	mathjax "github.com/litao91/goldmark-mathjax"
 	"github.com/yuin/goldmark"
@@ -25,7 +30,6 @@ import (
 type StaticMD struct {
 	parser  goldmark.Markdown
 	content fs.FS
-	debug   bool
 }
 
 type TemplParams struct {
@@ -34,7 +38,6 @@ type TemplParams struct {
 }
 
 func (s *StaticMD) GetRouter() http.Handler {
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pth := path.Clean(strings.Trim(r.URL.Path, "/"))
 
@@ -45,7 +48,7 @@ func (s *StaticMD) GetRouter() http.Handler {
 
 		templ, err := template.ParseFS(s.content, "templ/*")
 		if err != nil {
-			fmt.Println(err)
+			slog.ErrorContext(r.Context(), "Could not build compile template", slog.Any("error", err))
 			http.Error(w, "Could not compile template", http.StatusInternalServerError)
 			return
 		}
@@ -75,7 +78,7 @@ func (s *StaticMD) GetRouter() http.Handler {
 			}
 
 			if err := templ.ExecuteTemplate(w, "page.templ", t); err != nil {
-				fmt.Println(err)
+				slog.ErrorContext(r.Context(), "Could not execute template", slog.Any("error", err))
 			}
 			return
 		}
@@ -87,7 +90,7 @@ func (s *StaticMD) GetRouter() http.Handler {
 				Metadata: nil,
 			}
 			if err := templ.ExecuteTemplate(w, "page.templ", t); err != nil {
-				fmt.Println(err)
+				slog.ErrorContext(r.Context(), "Could not execute template", slog.Any("error", err))
 			}
 			return
 		}
@@ -104,7 +107,7 @@ func (s *StaticMD) GetRouter() http.Handler {
 
 }
 
-func New(debug bool, ffs fs.FS) (*StaticMD, error) {
+func New(ffs fs.FS) *StaticMD {
 
 	md := goldmark.New(
 		goldmark.WithParserOptions(
@@ -125,28 +128,57 @@ func New(debug bool, ffs fs.FS) (*StaticMD, error) {
 		),
 	)
 
-	return &StaticMD{parser: md, content: ffs, debug: debug}, nil
-}
-
-type config struct {
-	Port  int    `env:"VRO_PORT" envDefault:"7000"`
-	Debug bool   `env:"VRO_DEBUG" envDefault:"false"`
-	Path  string `env:"VRO_PATH" envDefault:"/data"`
+	return &StaticMD{parser: md, content: ffs}
 }
 
 func main() {
-	cfg := config{}
-	if err := env.Parse(&cfg); err != nil {
-		log.Fatal(err)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{AddSource: true})))
+
+	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	if err := run(ctx); err != nil {
+		slog.ErrorContext(ctx, "Error running server", slog.Any("error", err))
+	}
+}
+
+func run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+
+	address := os.Getenv("VRO_ADDRESS")
+	if address == "" {
+		port, err := strconv.Atoi(cmp.Or(os.Getenv("VRO_PORT"), "7000"))
+		if err != nil {
+			return err
+		}
+		address = net.JoinHostPort("", strconv.Itoa(port))
 	}
 
-	staticMD, err := New(cfg.Debug, os.DirFS(cfg.Path))
-	if err != nil {
-		log.Fatal(err)
+	staticMD := New(os.DirFS(cmp.Or(os.Getenv("VRO_PATH"), "/data")))
+
+	server := &http.Server{
+		Addr:    address,
+		Handler: staticMD.GetRouter(),
+
+		ReadHeaderTimeout: 1 * time.Minute,
 	}
 
-	log.Printf("Listening on port %d\n", cfg.Port)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", cfg.Port), staticMD.GetRouter()); err != nil {
-		log.Fatal(err)
-	}
+	slog.InfoContext(ctx, "Starting server", slog.Any("address", address))
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.ErrorContext(ctx, "Error initializing web server", slog.Any("error", err))
+			cancel()
+		}
+	}()
+
+	defer func() {
+		slog.InfoContext(ctx, "Shutting down")
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			slog.ErrorContext(ctx, "Error shutting down", slog.Any("error", err))
+		}
+	}()
+
+	<-ctx.Done()
+
+	return nil
 }

@@ -3,7 +3,6 @@ module github.com/AlexVasiluta/staticMD
 go 1.25
 
 require (
-	github.com/caarlos0/env/v6 v6.10.1
 	github.com/litao91/goldmark-mathjax v0.0.0-20210217064022-a43cf739a50f
 	github.com/yuin/goldmark v1.8.6
 	github.com/yuin/goldmark-highlighting/v2 v2.0.0-20230729083705-37449abec8cc
